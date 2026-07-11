@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual Environment
+venv/
+.venv/
+backend/venv/
+slack_app/.venv/
+
+# Environment Variables (NEVER commit tokens)
+.env
+*.env
+backend/.env
+slack_app/.env
+
+# Node Modules
+frontend/node_modules/
+
+# Runtime Memory Storage
+backend/app/memory/memory.json
+slack_app/*.db
+slack_app/careerpilot_memory.db
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
