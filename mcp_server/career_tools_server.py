@@ -16,12 +16,46 @@ Run standalone (for debugging):
 """
 from __future__ import annotations
 
+import json
+import os
 import re
+import urllib.error
+import urllib.request
+from pathlib import Path
 from urllib.parse import quote_plus
+
+try:  # Load .env so a standalone run / subprocess finds JSEARCH_API_KEY.
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).resolve().parent.parent / "slack_app" / ".env")
+except Exception:  # noqa: BLE001 - dotenv is optional at runtime
+    pass
 
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("career-tools")
+
+# JSearch (RapidAPI) aggregates Google for Jobs and covers Pakistan/Islamabad.
+# Set JSEARCH_API_KEY in .env to enable live listings; without it the tool
+# gracefully falls back to curated search links + keywords.
+JSEARCH_HOST = "jsearch.p.rapidapi.com"
+LIVE_JOBS_LIMIT = 5
+
+# JSearch needs a country code (ISO 3166-1 alpha-2) to localise results.
+_PK_CITIES = {
+    "islamabad", "karachi", "lahore", "rawalpindi", "peshawar", "faisalabad",
+    "multan", "quetta", "sialkot", "gujranwala", "hyderabad", "pakistan",
+}
+_AE_CITIES = {"dubai", "abu dhabi", "sharjah", "ajman", "uae", "united arab emirates"}
+
+
+def _country_code(location: str) -> str:
+    loc = (location or "").lower()
+    if any(city in loc for city in _PK_CITIES):
+        return "pk"
+    if any(city in loc for city in _AE_CITIES):
+        return "ae"
+    return "us"
 
 # --- Curated knowledge bases (offline-safe, no external API needed) ---------
 
@@ -106,9 +140,70 @@ def _normalize_role(role: str) -> str:
     return "backend"
 
 
+def _fetch_live_jobs(role: str, location: str, seniority: str) -> list[dict]:
+    """Query JSearch (RapidAPI) for real listings. Returns [] if unavailable."""
+    api_key = os.getenv("JSEARCH_API_KEY", "").strip()
+    if not api_key:
+        return []
+
+    query = f"{seniority} {role} in {location}".strip()
+    url = (
+        f"https://{JSEARCH_HOST}/search-v2"
+        f"?query={quote_plus(query)}&page=1&num_pages=1"
+        f"&country={_country_code(location)}"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "X-RapidAPI-Key": api_key,
+            "X-RapidAPI-Host": JSEARCH_HOST,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ValueError):
+        return []
+
+    # search-v2 nests jobs under data.jobs; older /search returned a list.
+    data = payload.get("data")
+    if isinstance(data, dict):
+        items = data.get("jobs") or []
+    elif isinstance(data, list):
+        items = data
+    else:
+        items = []
+
+    jobs: list[dict] = []
+    for item in items[:LIVE_JOBS_LIMIT]:
+        city = item.get("job_city") or ""
+        country = item.get("job_country") or ""
+        where = ", ".join(p for p in (city, country) if p) or location
+        link = item.get("job_apply_link") or ""
+        if not link:
+            for opt in item.get("apply_options") or []:
+                if opt.get("apply_link"):
+                    link = opt["apply_link"]
+                    break
+        jobs.append(
+            {
+                "title": item.get("job_title") or role,
+                "company": item.get("employer_name") or "Unknown company",
+                "location": where,
+                "type": item.get("job_employment_type") or "",
+                "link": link,
+                "posted": item.get("job_posted_at_datetime_utc") or "",
+            }
+        )
+    return jobs
+
+
 @mcp.tool()
 def search_jobs(role: str, location: str = "Remote", seniority: str = "internship") -> str:
-    """Build targeted job-search queries and direct board links for a role.
+    """Find live job/internship listings for a role, with search links + keywords.
+
+    Returns real openings when a jobs API is configured (JSEARCH_API_KEY),
+    and always includes curated board links and resume keywords as a fallback.
 
     Args:
         role: Target role, e.g. "backend developer", "AI engineer".
@@ -126,7 +221,25 @@ def search_jobs(role: str, location: str = "Remote", seniority: str = "internshi
     key = _normalize_role(role)
     must_have = ", ".join(ROLE_KEYWORDS[key][:6])
 
-    lines = [f"*Job search plan for:* {seniority} {role} — {location}", ""]
+    lines: list[str] = []
+
+    live = _fetch_live_jobs(role, location, seniority)
+    if live:
+        lines.append(f"*Live {seniority} openings for {role} — {location}:*")
+        for i, job in enumerate(live, 1):
+            header = f"{i}. *{job['title']}* — {job['company']}"
+            if job["location"]:
+                header += f" ({job['location']})"
+            lines.append(header)
+            if job["link"]:
+                lines.append(f"   <{job['link']}|Apply here>")
+        lines.append("")
+    elif os.getenv("JSEARCH_API_KEY", "").strip():
+        lines.append("_No live listings found right now — try the search links below._")
+        lines.append("")
+
+    lines.append(f"*Job search plan for:* {seniority} {role} — {location}")
+    lines.append("")
     lines.append("*Direct search links:*")
     for name, url in links.items():
         lines.append(f"• <{url}|{name}>")
